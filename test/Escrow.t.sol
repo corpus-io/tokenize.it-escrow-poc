@@ -14,6 +14,8 @@ contract ERC20MintableByAnyone is ERC20 {
 }
 
 contract EscrowTest is Test {
+    error TimelockInsufficientDelay(uint256 delay, uint256 minDelay);
+
     ERC20MintableByAnyone token;
     TimelockController timelock;
 
@@ -231,19 +233,113 @@ contract EscrowTest is Test {
         );
     }
 
-    // function test_emitterCanTransferAfterDelay() public {
-    //     assertEq(
-    //         token.balanceOf(emitterAccount),
-    //         0,
-    //         "emitterAccount should have 0 tokens"
-    //     );
-    //     vm.prank(emitterAccount);
-    //     vm.warp(2 * 30 days + 1);
-    //     token.transferFrom(address(timelock), emitterAccount, 100);
-    //     assertEq(
-    //         token.balanceOf(emitterAccount),
-    //         100,
-    //         "emitterAccount should have 100 tokens"
-    //     );
-    // }
+    function test_emitterCanTransferAfterDelay() public {
+        assertEq(
+            token.balanceOf(emitterAccount),
+            0,
+            "emitterAccount should have 0 tokens"
+        );
+
+        payload = abi.encodeWithSignature(
+            "transfer(address,uint256)",
+            emitterAccount,
+            100
+        );
+        target = address(token);
+        delay = 2 * 30 days;
+
+        vm.prank(emitterAccount);
+        timelock.schedule(target, value, payload, predecessor, salt, delay);
+        vm.warp(2 * 30 days + 10); // we did some warping in setup, so we need to add 10 seconds
+
+        vm.prank(emitterAccount);
+        timelock.execute(target, value, payload, predecessor, salt);
+        assertEq(
+            token.balanceOf(emitterAccount),
+            100,
+            "emitterAccount should have 100 tokens"
+        );
+    }
+
+    function test_emitterCanNotProposeShorterDelay() public {
+        assertEq(
+            token.balanceOf(emitterAccount),
+            0,
+            "emitterAccount should have 0 tokens"
+        );
+
+        payload = abi.encodeWithSignature(
+            "transfer(address,uint256)",
+            emitterAccount,
+            100
+        );
+        target = address(token);
+        delay = 2 * 29 days;
+
+        vm.prank(emitterAccount);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                TimelockInsufficientDelay.selector,
+                2 * 29 days,
+                2 * 30 days
+            )
+        );
+        timelock.schedule(target, value, payload, predecessor, salt, delay);
+    }
+
+    function test_emitterCanNotExecuteBeforeDelayHasPassed() public {
+        assertEq(
+            token.balanceOf(emitterAccount),
+            0,
+            "emitterAccount should have 0 tokens"
+        );
+
+        payload = abi.encodeWithSignature(
+            "transfer(address,uint256)",
+            emitterAccount,
+            100
+        );
+        target = address(token);
+        delay = 2 * 30 days;
+
+        vm.prank(emitterAccount);
+        timelock.schedule(target, value, payload, predecessor, salt, delay);
+        vm.warp(2 * 30 days - 1);
+
+        vm.prank(emitterAccount);
+        vm.expectRevert(); // not extracting the precise error now
+        timelock.execute(target, value, payload, predecessor, salt);
+    }
+
+    /**
+     * BEHOLD! The emitter can approve itself for infinite allowance
+     * -> this breaks the security model of the timelock in our application
+     */
+    function test_emitterCanApproveSelf() public {
+        assertEq(
+            token.allowance(address(timelock), emitterAccount),
+            0,
+            "emitterAccount should have 0 allowance"
+        );
+
+        payload = abi.encodeWithSignature(
+            "approve(address,uint256)",
+            emitterAccount,
+            type(uint256).max
+        );
+        target = address(token);
+        delay = 2 * 30 days;
+
+        vm.prank(emitterAccount);
+        timelock.schedule(target, value, payload, predecessor, salt, delay);
+        vm.warp(2 * 30 days + 10); // we did some warping in setup, so we need to add 10 seconds
+
+        vm.prank(emitterAccount);
+        timelock.execute(target, value, payload, predecessor, salt);
+        assertEq(
+            token.allowance(address(timelock), emitterAccount),
+            type(uint256).max,
+            "emitterAccount should have infinite allowance"
+        );
+    }
 }
