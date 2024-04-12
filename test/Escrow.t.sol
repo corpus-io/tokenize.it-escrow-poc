@@ -26,11 +26,25 @@ contract EscrowTest is Test {
     address public emitterAccount = vm.addr(emitterPK);
     address public platformHotAccount = address(this);
 
+    // we re-use these variables for multiple operations
+    address target;
+    uint256 value = 0; // no value
+    bytes payload =
+        abi.encodeWithSignature(
+            "approve(address,uint256)",
+            platformColdAccount,
+            type(uint256).max
+        );
+    bytes32 predecessor = 0x0; // no predecessor
+    bytes32 salt = 0x0; // no salt
+    uint256 delay = 1;
+
     function setUp() public {
         vm.warp(1); // otherwise, weird stuff happens
 
         // create the erc20 token
         token = new ERC20MintableByAnyone("test_token", "TT");
+        target = address(token);
 
         // create the time lock controller. emitter is proposer and executor, platform is admin
         address[] memory roleHolders = new address[](2);
@@ -43,20 +57,8 @@ contract EscrowTest is Test {
             platformHotAccount // the executing hot wallet is admin for now
         );
 
-        // use admin to give allowances
-        address target = address(token);
-        uint256 value = 0; // no value
-        bytes memory payload = abi.encodeWithSignature(
-            "approve(address,uint256)",
-            platformColdAccount,
-            type(uint256).max
-        );
-        bytes32 predecessor = 0x0; // no predecessor
-        bytes32 salt = 0x0; // no salt
-        uint256 delay = 1;
-
         // get id
-        bytes32 id = timelock.hashOperation(
+        bytes32 id2 = timelock.hashOperation(
             target,
             value,
             payload,
@@ -64,34 +66,106 @@ contract EscrowTest is Test {
             salt
         );
 
-        // propose operation
-        assertEq(timelock.isOperation(id), false, "operation should not exist");
-        timelock.schedule(target, value, payload, predecessor, salt, delay);
-        assertEq(timelock.isOperation(id), true, "operation should exist");
+        // propose operation #1
         assertEq(
-            timelock.isOperationPending(id),
+            timelock.isOperation(id2),
+            false,
+            "operation should not exist"
+        );
+        timelock.schedule(target, value, payload, predecessor, salt, delay);
+        assertEq(timelock.isOperation(id2), true, "operation should exist");
+        assertEq(
+            timelock.isOperationPending(id2),
             true,
             "operation should be pending"
         );
 
-        // execute operation
-        // assertEq(
-        //     timelock.isOperationPending(id),
-        //     true,
-        //     "operation should be pending"
-        // );
         // increase time by one second
-        vm.warp(3);
+        vm.warp(2);
+
+        // execute operation
         assertEq(
-            timelock.isOperationReady(id),
+            timelock.isOperationReady(id2),
             true,
             "operation should be ready"
         );
         timelock.execute(target, value, payload, predecessor, salt);
         assertEq(
-            timelock.isOperationDone(id),
+            timelock.isOperationDone(id2),
             true,
             "operation should be done"
+        );
+
+        // check that the allowance was set
+        assertEq(
+            token.allowance(address(timelock), platformColdAccount),
+            type(uint256).max,
+            "allowance for platformColdAccount should be max"
+        );
+
+        //propose and execute second operation
+        payload = abi.encodeWithSignature(
+            "approve(address,uint256)",
+            roofAccount,
+            type(uint256).max
+        );
+        timelock.schedule(target, value, payload, predecessor, salt, delay);
+        vm.warp(3);
+        timelock.execute(target, value, payload, predecessor, salt);
+        assertEq(
+            token.allowance(address(timelock), roofAccount),
+            type(uint256).max,
+            "allowance for roofAccount should be max"
+        );
+
+        console.log("updating delay next");
+
+        // update timelock delay to 2 months. This requires a new operation.
+        payload = abi.encodeWithSignature("updateDelay(uint256)", 2 * 30 days);
+        timelock.schedule(
+            address(timelock), // notice how timelok calls itself here
+            value,
+            payload,
+            predecessor,
+            salt,
+            delay
+        );
+        vm.warp(4);
+        timelock.execute(address(timelock), value, payload, predecessor, salt);
+        assertEq(
+            timelock.getMinDelay(),
+            2 * 30 days,
+            "timelock delay should be 2 months"
+        );
+
+        console.log("revoking roles next");
+
+        // remove platform as admin, executor and proposer
+        timelock.revokeRole(timelock.PROPOSER_ROLE(), platformHotAccount);
+        timelock.revokeRole(timelock.CANCELLER_ROLE(), platformHotAccount);
+        timelock.revokeRole(timelock.EXECUTOR_ROLE(), platformHotAccount);
+        timelock.revokeRole(timelock.DEFAULT_ADMIN_ROLE(), platformHotAccount);
+
+        // check that platform no longer holds roles
+        assertEq(
+            timelock.hasRole(timelock.DEFAULT_ADMIN_ROLE(), platformHotAccount),
+            false,
+            "platform should not be admin"
+        );
+        assertEq(
+            timelock.hasRole(timelock.PROPOSER_ROLE(), platformHotAccount),
+            false,
+            "platform should not be proposer"
+        );
+        assertEq(
+            timelock.hasRole(timelock.EXECUTOR_ROLE(), platformHotAccount),
+            false,
+            "platform should not be executor"
+        );
+        assertEq(
+            timelock.hasRole(timelock.CANCELLER_ROLE(), platformHotAccount),
+            false,
+            "platform should not be canceller"
         );
 
         // mint some tokens to the timelock
@@ -99,7 +173,77 @@ contract EscrowTest is Test {
     }
 
     function test_platformCanTransfer() public {
+        assertEq(
+            token.balanceOf(platformColdAccount),
+            0,
+            "platformColdAccount should have 0 tokens"
+        );
         vm.prank(platformColdAccount);
         token.transferFrom(address(timelock), platformColdAccount, 100);
+        assertEq(
+            token.balanceOf(platformColdAccount),
+            100,
+            "platformColdAccount should have 100 tokens"
+        );
     }
+
+    function test_roofCanTransfer() public {
+        assertEq(
+            token.balanceOf(roofAccount),
+            0,
+            "roofAccount should have 0 tokens"
+        );
+        vm.prank(roofAccount);
+        token.transferFrom(address(timelock), roofAccount, 100);
+        assertEq(
+            token.balanceOf(roofAccount),
+            100,
+            "roofAccount should have 100 tokens"
+        );
+    }
+
+    function test_RandoCanNotTransfer(address rando) public {
+        vm.assume(rando != roofAccount && rando != platformColdAccount);
+        assertEq(token.balanceOf(rando), 0, "rando should have 0 tokens");
+        vm.prank(rando);
+        vm.expectRevert();
+        token.transferFrom(address(timelock), rando, 100);
+        vm.assertEq(
+            token.balanceOf(rando),
+            0,
+            "rando should still have 0 tokens"
+        );
+    }
+
+    function test_emitterCanNotTransferImmediately() public {
+        assertEq(
+            token.balanceOf(emitterAccount),
+            0,
+            "emitterAccount should have 0 tokens"
+        );
+        vm.prank(emitterAccount);
+        vm.expectRevert();
+        token.transferFrom(address(timelock), emitterAccount, 100);
+        vm.assertEq(
+            token.balanceOf(emitterAccount),
+            0,
+            "emitterAccount should still have 0 tokens"
+        );
+    }
+
+    // function test_emitterCanTransferAfterDelay() public {
+    //     assertEq(
+    //         token.balanceOf(emitterAccount),
+    //         0,
+    //         "emitterAccount should have 0 tokens"
+    //     );
+    //     vm.prank(emitterAccount);
+    //     vm.warp(2 * 30 days + 1);
+    //     token.transferFrom(address(timelock), emitterAccount, 100);
+    //     assertEq(
+    //         token.balanceOf(emitterAccount),
+    //         100,
+    //         "emitterAccount should have 100 tokens"
+    //     );
+    // }
 }
